@@ -85,6 +85,17 @@ const userSchema = new mongoose.Schema(
       type: Boolean,
       default: true,
     },
+
+    // Cross-cluster reference ID — format: usr_<12-char-hex>
+    // Used by seller-backend, admin-backend, etc. to reference this user
+    // without needing a direct connection to the greencard-user Atlas cluster.
+    // Generated on first save via shared/utils/prefixedId.js → generateId('user')
+    publicId: {
+      type:   String,
+      unique: true,
+      sparse: true,
+      index:  true,
+    },
   },
   { timestamps: true }
 );

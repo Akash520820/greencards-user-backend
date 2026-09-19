@@ -7,10 +7,14 @@ const Order = require("../models/order.model");
 const Cart = require("../models/cart.model");
 const Product = require("../models/product.model");
 const Coupon = require("../models/coupon.model");
+const Outbox = require("../models/outbox.model");
 const razorpayInstance = require("../shared/utils/razorpay");
 const logger = require("../shared/utils/logger");
 const { generateOrderInvoicePDF } = require("../shared/utils/invoice.service");
 const SellerProfile = require("../models/sellerProfile.model");
+const { signOrder, verifyOrder } = require("../shared/utils/hmac.util");
+const { logSecurityEvent } = require("../shared/utils/auditLog.util");
+const { generateId } = require("../shared/utils/prefixedId");
 
 
 const SHIPPING_PRICE = 50;
@@ -168,9 +172,6 @@ const placeOrder = asyncHandler(async (req, res) => {
     // operation (see atomicallyDecrementStock), and all of them happen
     // inside a single transaction — so either every item's stock is
     // successfully reserved and the order is created, or none of it is.
-    // A concurrent checkout racing for the same unit will simply fail this
-    // atomic update for whichever request loses the race, instead of both
-    // requests reading "in stock" and overselling.
     for (const item of items) {
       const product = item.product;
 
@@ -198,24 +199,46 @@ const placeOrder = asyncHandler(async (req, res) => {
         throw new ApiError(400, `Insufficient stock for ${product.name}`);
       }
 
-      const { sellingPrice } = product.getPriceForVariant(item.variant || {});
+      const { sellingPrice, mrp } = product.getPriceForVariant(item.variant || {});
       const variantImages = product.getImagesForVariant(color);
 
+      // Build embedded product snapshot — this is immutable after save.
+      // productId and sellerId use publicId (string) not ObjectId, because
+      // after the DB split they live on a different cluster.
       orderItems.push({
-        product: product._id,
-        seller: product.createdBy,
-        name: product.name,
-        image: variantImages[0],
-        price: sellingPrice,
-        quantity: item.quantity,
-        variant: item.variant,
+        productId:     product.publicId || product._id.toString(),
+        sellerId:      product.createdBy?.toString(),
+        name:          product.name,
+        image:         variantImages[0],
+        brand:         product.brand || "",
+        categoryName:  "",          // category name resolved if needed via seller-backend
+        sku:           product.sku || "",
+        variant:       item.variant || {},
+        price:         sellingPrice,
+        originalPrice: mrp,
+        quantity:      item.quantity,
       });
-
 
       itemsPrice += sellingPrice * item.quantity;
     }
 
-    const totalPrice = itemsPrice + SHIPPING_PRICE;
+    const totalPrice    = itemsPrice + SHIPPING_PRICE;
+    const discountAmount = 0; // coupon logic can set this
+    const orderPublicId  = generateId("order");
+    const now            = new Date().toISOString();
+
+    // Compute HMAC signature over financial fields BEFORE inserting.
+    // This binds the amounts to the userId and timestamp so any subsequent
+    // direct-DB modification of totalPrice will be caught by verifyOrder().
+    const integrityHash = signOrder({
+      userId:         req.user._id.toString(),
+      itemsPrice,
+      discountAmount,
+      shippingPrice:  SHIPPING_PRICE,
+      totalPrice,
+      paymentMethod,
+      createdAt:      now,
+    });
 
     const [createdOrder] = await Order.create(
       [
@@ -225,6 +248,7 @@ const placeOrder = asyncHandler(async (req, res) => {
           shippingAddress,
           itemsPrice,
           shippingPrice: SHIPPING_PRICE,
+          discountAmount,
           totalPrice,
           paymentMethod,
           paymentStatus: paymentMethod === "razorpay" ? "paid" : "pending",
@@ -232,6 +256,33 @@ const placeOrder = asyncHandler(async (req, res) => {
           razorpayPaymentId,
           razorpaySignature,
           idempotencyKey,
+          publicId:      orderPublicId,
+          integrityHash,
+        },
+      ],
+      { session }
+    );
+
+    // Write the Outbox event IN THE SAME TRANSACTION as the order.
+    // If the process crashes between order creation and HTTP notification to
+    // seller-backend, the outbox poller will pick this up and retry delivery.
+    await Outbox.create(
+      [
+        {
+          eventType:     "ORDER_CREATED",
+          targetService: "seller-backend",
+          payload: {
+            orderId:  createdOrder._id.toString(),
+            publicId: orderPublicId,
+            userId:   req.user._id.toString(),
+            items:    orderItems.map((i) => ({
+              productId: i.productId,
+              sellerId:  i.sellerId,
+              variant:   i.variant,
+              quantity:  i.quantity,
+              price:     i.price,
+            })),
+          },
         },
       ],
       { session }
@@ -245,10 +296,11 @@ const placeOrder = asyncHandler(async (req, res) => {
     return createdOrder;
   });
 
-  logger.info(`Order ${order._id} placed by user ${req.user._id} — total ₹${order.totalPrice}`);
+  logger.info(`Order ${order.publicId} placed by user ${req.user._id} — total ₹${order.totalPrice}`);
 
   return res.status(201).json(new ApiResponse(201, order, "Order placed successfully"));
 });
+
 
 const razorpayWebhook = asyncHandler(async (req, res) => {
   const signature = req.headers["x-razorpay-signature"];
@@ -293,9 +345,11 @@ const getMyOrders = asyncHandler(async (req, res) => {
 const getOrderById = asyncHandler(async (req, res) => {
   const { orderId } = req.params;
 
-  const order = await Order.findById(orderId)
-    .populate("user", "userName email")
-    .populate("items.seller", "fullName storeName companyEmail email");
+  // Note: items.seller is now a string (sellerId publicId), not an ObjectId ref.
+  // We do NOT populate it — that seller document lives in greencard-seller cluster.
+  // The embedded snapshot fields (name, image, price, etc.) have everything the
+  // frontend needs to render the order detail page.
+  const order = await Order.findById(orderId).populate("user", "userName email");
   if (!order) {
     throw new ApiError(404, "Order not found");
   }
@@ -312,14 +366,14 @@ const getAllOrders = asyncHandler(async (req, res) => {
 
   const filter = {};
   if (status) filter.orderStatus = status;
-  if (sellerId) filter["items.seller"] = sellerId;
+  // sellerId is now a string field (publicId), not an ObjectId ref
+  if (sellerId) filter["items.sellerId"] = sellerId;
 
   const skip = (Number(page) - 1) * Number(limit);
 
   const [orders, total] = await Promise.all([
     Order.find(filter)
       .populate("user", "userName email")
-      .populate("items.seller", "fullName storeName companyEmail email")
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(Number(limit)),
@@ -357,11 +411,9 @@ const updateOrderStatus = asyncHandler(async (req, res) => {
   await order.save();
 
   if (orderStatus === "delivered") {
-    // Staged seller trust levels (Phase 8): bump each involved seller's
-    // trust tier now that this order has actually completed. A seller
-    // fulfilling multiple items in the same order only counts once here
-    // per distinct seller.
-    const sellerIds = [...new Set(order.items.map((item) => item.seller?.toString()).filter(Boolean))];
+    // sellerId is now a plain string (publicId) — use it directly.
+    // SellerProfile.recalculateTrustLevel needs to query by this public ID.
+    const sellerIds = [...new Set(order.items.map((item) => item.sellerId).filter(Boolean))];
     await Promise.all(sellerIds.map((sellerId) => SellerProfile.recalculateTrustLevel(sellerId)));
   }
 
@@ -369,15 +421,51 @@ const updateOrderStatus = asyncHandler(async (req, res) => {
 });
 
 const downloadOrderInvoice = asyncHandler(async (req, res) => {
-
   const { orderId } = req.params;
-  const order = await Order.findById(orderId).populate("user", "userName email");
+
+  // Fetch with integrityHash (select:false field) so we can verify before generating
+  const order = await Order.findById(orderId)
+    .populate("user", "userName email")
+    .select("+integrityHash");
+
   if (!order) {
     throw new ApiError(404, "Order not found");
   }
 
   if (order.user._id.toString() !== req.user._id.toString() && req.user.role !== "admin") {
     throw new ApiError(403, "Access denied");
+  }
+
+  // HMAC integrity check — verify the financial fields have not been tampered with
+  // since the order was created. This runs before any invoice generation or refund.
+  if (order.integrityHash) {
+    const isValid = verifyOrder(
+      {
+        userId:         order.user._id.toString(),
+        itemsPrice:     order.itemsPrice,
+        discountAmount: order.discountAmount ?? 0,
+        shippingPrice:  order.shippingPrice,
+        totalPrice:     order.totalPrice,
+        paymentMethod:  order.paymentMethod,
+        createdAt:      order.createdAt.toISOString(),
+      },
+      order.integrityHash
+    );
+
+    if (!isValid) {
+      // Log critical security event to superadmin audit cluster
+      await logSecurityEvent({
+        action:       "ORDER_INTEGRITY_FAILURE",
+        performedBy:  req.user._id.toString(),
+        targetEntity: "order",
+        targetId:     order.publicId || orderId,
+        severity:     "CRITICAL",
+        metadata:     { orderId, userId: req.user._id.toString() },
+        ipAddress:    req.ip,
+      });
+      logger.error(`HMAC integrity failure on order ${orderId} — possible tampering`);
+      throw new ApiError(500, "Order integrity check failed — please contact support");
+    }
   }
 
   const pdfBuffer = await generateOrderInvoicePDF(order);

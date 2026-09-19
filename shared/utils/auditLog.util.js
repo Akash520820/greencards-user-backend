@@ -1,25 +1,56 @@
-const AuditLog = require("../../models/auditLog.model");
 const logger = require("./logger");
 
-// Single entry point for writing to the audit trail. Fire-and-forget by
-// design: a logging failure should never block or fail the actual
-// request it's describing, so errors are caught and logged, not thrown.
-//
-// Usage: await logAudit(req.staff, "seller.approve", { type: "SellerProfile", id: sellerProfile._id }, { ... }, req)
-const logAudit = async (actor, action, target = {}, metadata = {}, req = null) => {
+/**
+ * Sends a security event to the superadmin-backend's append-only audit log.
+ * Fire-and-forget: if the call fails, it logs locally but does NOT throw —
+ * a logging failure must never block or crash the main operation.
+ *
+ * In the 4-cluster architecture, audit logs live on a completely separate
+ * cluster (greencard-superadmin). Even if an attacker compromises this
+ * service's cluster, they cannot reach or delete the audit trail.
+ *
+ * @param {object} opts
+ * @param {string} opts.action        - Event name e.g. "ORDER_INTEGRITY_FAILURE"
+ * @param {string} opts.performedBy   - publicId of the actor
+ * @param {string} [opts.targetEntity] - Entity type e.g. "order"
+ * @param {string} [opts.targetId]    - publicId of the affected entity
+ * @param {"INFO"|"WARNING"|"CRITICAL"} [opts.severity]
+ * @param {object} [opts.metadata]    - Any extra context
+ * @param {string} [opts.ipAddress]
+ */
+const logSecurityEvent = async ({
+  action,
+  performedBy,
+  targetEntity,
+  targetId,
+  severity = "INFO",
+  metadata = {},
+  ipAddress,
+}) => {
+  const superadminUrl = process.env.SUPERADMIN_BACKEND_INTERNAL_URL;
+  if (!superadminUrl) {
+    logger.warn("logSecurityEvent: SUPERADMIN_BACKEND_INTERNAL_URL not set — audit log not sent", { action, severity });
+    return;
+  }
+
   try {
-    await AuditLog.create({
-      actorId: actor?._id,
-      actorEmail: actor?.companyEmail,
-      action,
-      targetType: target.type,
-      targetId: target.id,
-      metadata,
-      ipAddress: req?.ip,
+    await fetch(`${superadminUrl}/internal/audit`, {
+      method:  "POST",
+      headers: {
+        "Content-Type":      "application/json",
+        "x-internal-secret": process.env.INTERNAL_API_SECRET,
+      },
+      body:   JSON.stringify({ action, performedBy, targetEntity, targetId, severity, metadata, ipAddress }),
+      signal: AbortSignal.timeout(3000),
     });
   } catch (err) {
-    logger.error("Failed to write audit log", { action, error: err?.message });
+    // Log locally — never crash the caller
+    logger.error("logSecurityEvent: failed to write to superadmin audit log", {
+      action,
+      severity,
+      error: err.message,
+    });
   }
 };
 
-module.exports = { logAudit };
+module.exports = { logSecurityEvent };

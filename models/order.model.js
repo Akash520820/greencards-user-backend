@@ -1,20 +1,44 @@
 const mongoose = require("mongoose");
 
+// ─── Embedded product snapshot ────────────────────────────────────────────────
+// In the 4-cluster split database, user-backend connects ONLY to the
+// greencard-user Atlas cluster. It has no network path to the greencard-seller
+// cluster where Product documents live.
+//
+// Instead of storing an ObjectId ref and later calling populate() across
+// clusters (which would silently return null), we copy the fields we need
+// from the Product at the moment the order is placed.
+//
+// Benefits:
+//   • Price freeze — the amount the customer paid is preserved forever, even if
+//     the seller later changes the product price.
+//   • Delete-safe — order history still renders correctly even after the seller
+//     deletes the product.
+//   • Zero cross-cluster reads — order listing/detail pages need no external calls.
 const orderItemSchema = new mongoose.Schema(
   {
-    product: { type: mongoose.Schema.Types.ObjectId, ref: "Product", required: true },
-    seller: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
-    name: { type: String, required: true },
-    image: { type: String, required: true },
-    price: { type: Number, required: true },
-    quantity: { type: Number, required: true },
+    // Cross-service reference IDs — stored as strings (not ObjectId) because
+    // they live on a different cluster. Use publicId format: prd_xxx, sel_xxx.
+    // NEVER call populate() on these fields.
+    productId:     { type: String, required: true, index: true },
+    sellerId:      { type: String, required: true, index: true },
+
+    // Immutable snapshot — copied from Product document at order creation time.
+    name:          { type: String, required: true },
+    image:         { type: String, required: true }, // first image at time of purchase
+    brand:         { type: String },
+    categoryName:  { type: String },                 // category name string, NOT an ObjectId
+    sku:           { type: String },
     variant: {
-      size: { type: String },
       color: { type: String },
+      size:  { type: String },
     },
+    price:         { type: Number, required: true },  // final price actually paid (after discounts)
+    originalPrice: { type: Number, required: true },  // MRP at time of order
+    quantity:      { type: Number, required: true },
     itemStatus: {
-      type: String,
-      enum: ["processing", "shipped", "delivered", "cancelled", "returned"],
+      type:    String,
+      enum:    ["processing", "shipped", "delivered", "cancelled", "returned"],
       default: "processing",
     },
   },
@@ -80,8 +104,28 @@ const orderSchema = new mongoose.Schema(
       sparse: true,
       index: true,
     },
+
+    // Cross-cluster reference ID — format: ord_<12-char-hex>
+    // Used by seller-backend and other services to reference this order
+    // without needing access to the greencard-user Atlas cluster.
+    publicId: {
+      type:   String,
+      unique: true,
+      sparse: true,
+      index:  true,
+    },
+
+    // HMAC-SHA256 signature of the order's financial fields (totalPrice,
+    // itemsPrice, discountAmount, shippingPrice, paymentMethod, userId).
+    // Computed with ORDER_HMAC_SECRET at creation time; verified before any
+    // refund, invoice generation, or financial reporting.
+    // select:false means this field is NEVER included in API responses.
+    integrityHash: {
+      type:   String,
+      select: false,
+    },
   },
   { timestamps: true }
 );
 
-module.exports = mongoose.model("Order", orderSchema);
+module.exports = mongoose.model("Order", orderSchema);
