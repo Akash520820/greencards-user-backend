@@ -9,8 +9,11 @@
  * Format: <prefix>_<12-char-hex>
  * Example: prd_1a2b3c4d5e6f  (a product ID)
  *          usr_9z8y7x6w5v4u  (a user ID)
+ *
+ * Uses Node's built-in crypto.randomBytes — no external package needed,
+ * fully CommonJS-compatible (uuid v9+ is ESM-only and breaks Jest).
  */
-const { v4: uuidv4 } = require("uuid");
+const crypto = require("crypto");
 
 const PREFIXES = {
   user:     "usr",
@@ -29,7 +32,8 @@ const PREFIXES = {
 const generateId = (entity) => {
   const prefix = PREFIXES[entity];
   if (!prefix) throw new Error(`Unknown entity type: "${entity}". Valid types: ${Object.keys(PREFIXES).join(", ")}`);
-  const short = uuidv4().replace(/-/g, "").substring(0, 12);
+  // 6 random bytes → 12 hex characters — same length as before, no external package
+  const short = crypto.randomBytes(6).toString("hex");
   return `${prefix}_${short}`;
 };
 
