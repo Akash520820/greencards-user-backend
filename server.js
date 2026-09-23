@@ -3,6 +3,7 @@ const app = require("./app");
 const connectDB = require("./shared/db/index");
 const logger = require("./shared/utils/logger");
 const { startPoller } = require("./shared/workers/outboxPoller");
+const startKeepAlive = require("./shared/utils/keepAlive");
 
 const PORT = process.env.PORT || process.env.USER_SERVICE_PORT || 5001;
 
@@ -14,6 +15,8 @@ connectDB()
     });
     // Start background outbox poller — delivers ORDER_CREATED events to seller-backend
     startPoller();
+    // Start keep-alive self-pinging on Render
+    startKeepAlive();
   })
   .catch((err) => {
     logger.error("MongoDB connection failed in User Microservice:", err);
