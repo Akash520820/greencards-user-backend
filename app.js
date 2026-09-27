@@ -26,7 +26,28 @@ app.set("trust proxy", 1);
 
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
 app.use(compression());
-app.use(cors({ origin: true, credentials: true }));
+
+// ─── CORS allowlist ───────────────────────────────────────────────────────────
+// FRONTEND_ORIGINS: comma-separated, set on Render. Falls back to localhost for dev.
+const ALLOWED_ORIGINS = (
+  process.env.FRONTEND_ORIGINS || "http://localhost:5173,http://localhost:3000"
+)
+  .split(",")
+  .map((o) => o.trim())
+  .filter(Boolean);
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error(`CORS: origin '${origin}' not allowed`));
+      }
+    },
+    credentials: true,
+  })
+);
 
 // raw body ONLY for Razorpay webhook route — must come BEFORE express.json()
 app.use("/api/v1/orders/webhook", express.raw({ type: "application/json" }));
