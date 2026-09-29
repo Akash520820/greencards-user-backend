@@ -2,6 +2,7 @@ const asyncHandler = require("../shared/utils/asyncHandler");
 const ApiError = require("../shared/utils/ApiError");
 const ApiResponse = require("../shared/utils/ApiResponse");
 const Product = require("../models/product.model");
+const User = require("../models/user.model");
 const Category = require("../models/category.model");
 const { uploadOnCloudinary } = require("../shared/utils/cloudinary");
 const mongoose = require("mongoose");
@@ -22,7 +23,7 @@ const isSearchIndexMissingError = (err) =>
 
 // ---- CREATE product (admin or approved seller — creator becomes the owner) ----
 const createProduct = asyncHandler(async (req, res) => {
-  const { name, description, category, price, discountPrice, stock, sku, brand, colorVariants } = req.body;
+  const { name, description, category, price, discountPrice, stock, sku, brand, colorVariants, sellerId } = req.body;
 
   if (!name || !description || !category || !price) {
     throw new ApiError(400, "Name, description, category, and price are required");
@@ -55,6 +56,17 @@ const createProduct = asyncHandler(async (req, res) => {
     uploadedImages.push(uploaded.url);
   }
 
+  // Admin/superadmin may pass sellerId to attribute product to a specific seller.
+  // Sellers always own their own product regardless of what is passed.
+  let createdBy = req.user._id;
+  if ((req.user?.role === 'admin' || req.user?.role === 'superadmin') && sellerId) {
+    const sellerUser = await User.findOne({ _id: sellerId, role: 'seller', isActive: true });
+    if (!sellerUser) {
+      throw new ApiError(400, 'Invalid or inactive sellerId — must reference an approved seller account');
+    }
+    createdBy = sellerUser._id;
+  }
+
   const product = await Product.create({
     name: name.trim(),
     description,
@@ -66,7 +78,7 @@ const createProduct = asyncHandler(async (req, res) => {
     sku,
     brand,
     colorVariants: parsedColorVariants,
-    createdBy: req.user._id,
+    createdBy,
   });
 
   return res
