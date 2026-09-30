@@ -18,6 +18,7 @@ const reviewRouter   = require("./routes/review.routes");
 const wishlistRouter = require("./routes/wishlist.routes");
 const contactRouter  = require("./routes/contact.routes");
 const { handleIncomingEvent, handleInternalCommand } = require("./controllers/events.controller");
+const internalSecretGuard = require("./shared/middleware/internalSecret.middleware");
 
 const app = express();
 
@@ -76,11 +77,13 @@ app.use("/api/v1/contact",  contactRouter);
 
 // Internal Saga callback endpoint — receives STOCK_RESERVED / STOCK_FAILED
 // from seller-backend's outbox poller. NOT exposed through the API gateway.
-app.post("/internal/events",   handleIncomingEvent);
+// 🔒 Protected by x-internal-secret header guard.
+app.post("/internal/events",   internalSecretGuard, handleIncomingEvent);
 
 // Internal command endpoint — receives admin-driven mutations (activate/deactivate user, role updates).
 // Called directly by admin-backend. NOT exposed through the API gateway.
-app.post("/internal/commands", handleInternalCommand);
+// 🔒 Protected by x-internal-secret header guard.
+app.post("/internal/commands", internalSecretGuard, handleInternalCommand);
 
 app.use(notFound);
 app.use(errorHandler);
