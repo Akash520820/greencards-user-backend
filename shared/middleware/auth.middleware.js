@@ -20,6 +20,28 @@ const { logAudit } = require("../utils/auditLog.util");
 // reads req.user._id / req.user.role keeps working unchanged) AND sets
 // req.staff / req.isStaff for code that specifically needs to know it's
 // dealing with a staff session (audit logging, permission checks).
+// Helper to verify staff tokens using any configured staff secret.
+// Staff tokens may be signed by superadmin-backend (which issues staff tokens via /staff/login)
+// using either SUPERADMIN_ACCESS_TOKEN_SECRET or STAFF_ACCESS_TOKEN_SECRET.
+const verifyStaffToken = (token) => {
+  const secrets = [
+    process.env.STAFF_ACCESS_TOKEN_SECRET,
+    process.env.SUPERADMIN_ACCESS_TOKEN_SECRET,
+    process.env.ACCESS_TOKEN_SECRET,
+  ].filter(Boolean);
+
+  let lastErr;
+  for (const secret of secrets) {
+    try {
+      return jwt.verify(token, secret);
+    } catch (err) {
+      lastErr = err;
+      if (err.name === "TokenExpiredError") throw err;
+    }
+  }
+  throw lastErr || new ApiError(401, "Invalid access token");
+};
+
 const verifyJWT = asyncHandler(async (req, res, next) => {
   let staffToken = req.cookies?.staffAccessToken || req.cookies?.adminAccessToken;
   if (!staffToken) {
@@ -27,7 +49,7 @@ const verifyJWT = asyncHandler(async (req, res, next) => {
     if (authHeader && authHeader.startsWith("Bearer ")) {
       const candidate = authHeader.replace("Bearer ", "").trim();
       try {
-        jwt.verify(candidate, process.env.STAFF_ACCESS_TOKEN_SECRET);
+        verifyStaffToken(candidate);
         staffToken = candidate;
       } catch (e) {
         // Not a staff token
@@ -40,11 +62,20 @@ const verifyJWT = asyncHandler(async (req, res, next) => {
   if (staffToken) {
     let decoded;
     try {
-      decoded = jwt.verify(staffToken, process.env.STAFF_ACCESS_TOKEN_SECRET);
+      decoded = verifyStaffToken(staffToken);
     } catch (err) {
       throw new ApiError(401, err.name === "TokenExpiredError" ? "Access token expired" : "Invalid access token");
     }
-    const staff = await Staff.findById(decoded._id).select("-password -refreshToken -mfaSecret");
+    let staff = await Staff.findById(decoded._id).select("-password -refreshToken -mfaSecret");
+    if (!staff && decoded.isStaff) {
+      staff = {
+        _id: decoded._id,
+        role: decoded.role,
+        companyEmail: decoded.companyEmail,
+        isStaff: true,
+        isActive: true,
+      };
+    }
     if (!staff) {
       throw new ApiError(401, "Invalid access token");
     }
@@ -52,7 +83,9 @@ const verifyJWT = asyncHandler(async (req, res, next) => {
       throw new ApiError(403, "Your staff account has been deactivated");
     }
 
-    await applyJitExpiry(staff);
+    if (typeof staff.save === "function") {
+      await applyJitExpiry(staff);
+    }
 
     req.user = staff;
     req.staff = staff;
@@ -103,11 +136,20 @@ const verifyStaffJWT = asyncHandler(async (req, res, next) => {
 
   let decoded;
   try {
-    decoded = jwt.verify(staffToken, process.env.STAFF_ACCESS_TOKEN_SECRET);
+    decoded = verifyStaffToken(staffToken);
   } catch (err) {
     throw new ApiError(401, err.name === "TokenExpiredError" ? "Access token expired" : "Invalid access token");
   }
-  const staff = await Staff.findById(decoded._id).select("-password -refreshToken -mfaSecret");
+  let staff = await Staff.findById(decoded._id).select("-password -refreshToken -mfaSecret");
+  if (!staff && decoded.isStaff) {
+    staff = {
+      _id: decoded._id,
+      role: decoded.role,
+      companyEmail: decoded.companyEmail,
+      isStaff: true,
+      isActive: true,
+    };
+  }
   if (!staff) {
     throw new ApiError(401, "Invalid access token");
   }
@@ -115,7 +157,9 @@ const verifyStaffJWT = asyncHandler(async (req, res, next) => {
     throw new ApiError(403, "Your staff account has been deactivated");
   }
 
-  await applyJitExpiry(staff);
+  if (typeof staff.save === "function") {
+    await applyJitExpiry(staff);
+  }
 
   req.user = staff;
   req.staff = staff;
