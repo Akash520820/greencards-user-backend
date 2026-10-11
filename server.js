@@ -7,12 +7,13 @@ const startKeepAlive = require("./shared/utils/keepAlive");
 const mongoose = require("mongoose");
 
 // ─── Fail-fast: required env vars ────────────────────────────────────────────
-const REQUIRED_ENV_VARS = [
-  "MONGODB_URI",
-  "ACCESS_TOKEN_SECRET",
-  "REFRESH_TOKEN_SECRET",
-];
-const missing = REQUIRED_ENV_VARS.filter((v) => !process.env[v]);
+const { assertJwtConfig } = require("./shared/utils/jwtKeys");
+assertJwtConfig();
+
+const missing = [];
+if (!process.env.MONGODB_URI) missing.push("MONGODB_URI");
+if (!process.env.REFRESH_TOKEN_SECRET) missing.push("REFRESH_TOKEN_SECRET");
+
 if (missing.length > 0) {
   console.error(`[user-backend] Missing required environment variables: ${missing.join(", ")}`);
   console.error("Set them in your .env file (local) or Render Dashboard (production).");

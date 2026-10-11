@@ -118,23 +118,14 @@ staffSchema.methods.hasPermission = function (permission) {
   return this.permissions.includes(permission);
 };
 
-staffSchema.methods.generateAccessToken = function () {
-  return jwt.sign(
-    {
-      _id: this._id,
-      companyEmail: this.companyEmail,
-      role: this.role,
-      isStaff: true,
-    },
-    process.env.STAFF_ACCESS_TOKEN_SECRET,
-    { expiresIn: process.env.STAFF_ACCESS_TOKEN_EXPIRY }
-  );
+// superadmin passes every permission check regardless of the permissions array
+staffSchema.methods.hasPermission = function (permission) {
+  if (this.role === "superadmin") return true;
+  return this.permissions.includes(permission);
 };
 
-staffSchema.methods.generateRefreshToken = function () {
-  return jwt.sign({ _id: this._id, isStaff: true }, process.env.STAFF_REFRESH_TOKEN_SECRET, {
-    expiresIn: process.env.STAFF_REFRESH_TOKEN_EXPIRY,
-  });
-};
+// NOTE: Token-minting methods (generateAccessToken, generateRefreshToken)
+// were removed. Only greencards-superadmin-backend holds the STAFF private
+// key and can sign staff tokens.
 
 module.exports = mongoose.model("Staff", staffSchema);

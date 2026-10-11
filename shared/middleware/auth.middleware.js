@@ -1,4 +1,3 @@
-const jwt = require("jsonwebtoken");
 const asyncHandler = require("../utils/asyncHandler");
 const ApiError = require("../utils/ApiError");
 const User = require("../../models/user.model");
@@ -9,38 +8,24 @@ const { logAudit } = require("../utils/auditLog.util");
 // verifyJWT — now aware of TWO completely separate identity systems:
 //
 //   1. Customer/seller accounts (User collection, "accessToken" cookie,
-//      signed with ACCESS_TOKEN_SECRET)
+//      ES256, signed by user-backend's CUSTOMER private key)
 //   2. Staff accounts (Staff collection, "staffAccessToken" cookie,
-//      signed with STAFF_ACCESS_TOKEN_SECRET — a completely different
-//      secret, so a customer token is cryptographically incapable of
-//      passing as a staff token, not just "checked and rejected")
+//      ES256, signed by superadmin-backend's STAFF private key — a
+//      completely different key pair AND issuer, so a customer token is
+//      cryptographically incapable of passing as a staff token)
 //
 // It checks for the staff cookie first. Whichever one is found, it sets
 // req.user to the resulting document (so every existing controller that
 // reads req.user._id / req.user.role keeps working unchanged) AND sets
 // req.staff / req.isStaff for code that specifically needs to know it's
 // dealing with a staff session (audit logging, permission checks).
-// Helper to verify staff tokens using any configured staff secret.
-// Staff tokens may be signed by superadmin-backend (which issues staff tokens via /staff/login)
-// using either SUPERADMIN_ACCESS_TOKEN_SECRET or STAFF_ACCESS_TOKEN_SECRET.
-const verifyStaffToken = (token) => {
-  const secrets = [
-    process.env.STAFF_ACCESS_TOKEN_SECRET,
-    process.env.SUPERADMIN_ACCESS_TOKEN_SECRET,
-    process.env.ACCESS_TOKEN_SECRET,
-  ].filter(Boolean);
+const { verifyStaffAccessToken, verifyCustomerAccessToken } = require("../utils/jwtKeys");
 
-  let lastErr;
-  for (const secret of secrets) {
-    try {
-      return jwt.verify(token, secret);
-    } catch (err) {
-      lastErr = err;
-      if (err.name === "TokenExpiredError") throw err;
-    }
-  }
-  throw lastErr || new ApiError(401, "Invalid access token");
-};
+// ES256 only. Staff tokens are verified with the STAFF *public* key and
+// customer/seller tokens with the CUSTOMER *public* key, so this service can
+// read sessions but can never mint one. No shared secrets, no secret fallback
+// chain, no algorithm negotiation (see utils/jwtKeys.js).
+const verifyStaffToken = (token) => verifyStaffAccessToken(token);
 
 const verifyJWT = asyncHandler(async (req, res, next) => {
   let staffToken = req.cookies?.staffAccessToken || req.cookies?.adminAccessToken;
@@ -99,7 +84,7 @@ const verifyJWT = asyncHandler(async (req, res, next) => {
 
   let decoded;
   try {
-    decoded = jwt.verify(customerToken, process.env.ACCESS_TOKEN_SECRET);
+    decoded = verifyCustomerAccessToken(customerToken);
   } catch (err) {
     throw new ApiError(401, err.name === "TokenExpiredError" ? "Access token expired" : "Invalid access token");
   }
